@@ -82,6 +82,15 @@ export RDMA_TOOLS_IMAGE="$REGISTRY/$OCIR_NAMESPACE/rdma-tools:$TAG"
 export VLLM_IMAGE="$REGISTRY/$OCIR_NAMESPACE/vllm-mooncake:$TAG"
 ```
 
+Use the **full OCIR image reference**, including the registry hostname, whenever setting an image for Kubernetes: `fra.ocir.io/<tenancy-namespace>/<repository>:<tag>` (for example, `fra.ocir.io/fr9qm01oq44x/mooncake-store:5ac6dec`). Do not use a short name such as `<tenancy-namespace>/mooncake-store:5ac6dec`; CRI-O may reject it as ambiguous. Set `STORE_IMAGE` separately before expanding it as `IMAGE`, for example:
+
+```bash
+export STORE_IMAGE=fra.ocir.io/fr9qm01oq44x/mooncake-store:5ac6dec
+IMAGE="$STORE_IMAGE" PROTOCOL=tcp bash scripts/deploy-mooncake.sh
+```
+
+Avoid writing `STORE_IMAGE=... IMAGE="$STORE_IMAGE"` on the same command line: the shell expands `$STORE_IMAGE` before applying that command's temporary assignment.
+
 ## 2. Install DRANET and verify RDMA allocation
 
 Confirm your node pool carries the labels that select the driver, then install the pinned Helm chart, namespaces, and DeviceClass:
@@ -100,17 +109,19 @@ Run a two-pod RDMA smoke test; the pods request `ens800f0np0` from DRANET and an
 RDMA_TOOLS_IMAGE="$RDMA_TOOLS_IMAGE" bash scripts/apply-rdma-smoke.sh
 ```
 
-The script reports the two DRA interface addresses. In one terminal, start the server:
+The script reports the two DRA interface addresses. In one terminal, start the server using RoCE v2 GID index 5. On the tested BM.Optimized3.36 setup, index 3 was an all-zero GID; index 5 maps to `ens800f0np0` and is RoCE v2:
 
 ```bash
-kubectl -n rdma-workloads exec -it rdma-smoke-a -- ib_write_bw -d mlx5_2
+kubectl -n rdma-workloads exec -it rdma-smoke-a -- ib_write_bw -d mlx5_2 -x 5
 ```
 
 In another terminal, connect the other pod to the server address printed by the script:
 
 ```bash
-kubectl -n rdma-workloads exec -it rdma-smoke-b -- ib_write_bw -d mlx5_2 -F <RDMA_SMOKE_A_IP>
+kubectl -n rdma-workloads exec -it rdma-smoke-b -- ib_write_bw -d mlx5_2 -x 5 <RDMA_SMOKE_A_IP>
 ```
+
+If using a different NIC or node shape, inspect `/sys/class/infiniband/mlx5_2/ports/1/gid_attrs/` in both pods and select the GID index whose type is `RoCE v2` and whose netdev is `ens800f0np0`. Use that index on both server and client (`-x`); `-F` only changes CPU-frequency warning behavior.
 
 A successful bandwidth summary proves the DRA-allocated pod path between those two nodes. `rdma link show` reporting ACTIVE by itself only proves local link state. Clean up the smoke claims/pods when done:
 
@@ -157,10 +168,15 @@ The included reference settings reserve 128 GiB of RAM per owner and configure a
 
 The deployment is one master Deployment plus one owner per eligible node. The master uses a ClusterIP service. Owners advertise the node private IP and expose their service/data ports over the private worker network. Keep this path private; this kit does not create NSGs, public endpoints, or firewall rules.
 
-First start TCP and wait for readiness:
+If you enabled automatic NVMe preparation in Section 3, that command already deployed Mooncake over TCP and waited for the master and storage DaemonSet rollouts. Do not run the deploy command again; continue with the checks below. If you prepared NVMe manually, deploy Mooncake over TCP once now:
 
 ```bash
 IMAGE="$STORE_IMAGE" PROTOCOL=tcp bash scripts/deploy-mooncake.sh
+```
+
+Check the deployment:
+
+```bash
 kubectl -n mooncake get pods -o wide
 kubectl -n mooncake logs deployment/mooncake-master --tail=80
 kubectl -n mooncake logs -l app=mooncake-storage -c store --prefix --tail=80

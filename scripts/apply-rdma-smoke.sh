@@ -22,6 +22,6 @@ for pod in rdma-smoke-a rdma-smoke-b; do
 done
 SERVER_IP=$(kubectl -n rdma-workloads exec rdma-smoke-a -- sh -c "ip -o -4 addr show dev ens800f0np0 | awk '{print \$4}' | cut -d/ -f1")
 echo "RDMA server pod address: $SERVER_IP"
-echo 'In terminal A run: kubectl -n rdma-workloads exec -it rdma-smoke-a -- ib_write_bw -d mlx5_2'
-echo "In terminal B run: kubectl -n rdma-workloads exec -it rdma-smoke-b -- ib_write_bw -d mlx5_2 -F $SERVER_IP"
+echo 'In terminal A run: kubectl -n rdma-workloads exec -it rdma-smoke-a -- ib_write_bw -d mlx5_2 -x 5'
+echo "In terminal B run: kubectl -n rdma-workloads exec -it rdma-smoke-b -- ib_write_bw -d mlx5_2 -x 5 $SERVER_IP"
 echo 'Cleanup after testing: kubectl -n rdma-workloads delete -f k8s/dranet/rdma-smoke.yaml'

@@ -115,7 +115,7 @@ store = {
     'volumeMounts': [mount],
     'resources': {'requests': {'cpu': '2', 'memory': f'{a.ram_gib + 8}Gi'},
                   'limits': {'memory': f'{a.ram_gib + 32}Gi'}},
-    'securityContext': {'allowPrivilegeEscalation': False,
+    'securityContext': {'privileged': False, 'allowPrivilegeEscalation': False,
                         'capabilities': {'drop': ['ALL'], 'add': ['IPC_LOCK']}},
     'startupProbe': {**probe(9300), 'failureThreshold': 180},
     'readinessProbe': probe(9300),
