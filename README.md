@@ -50,6 +50,8 @@ If you do not already have the secret, create it with your OCIR auth token using
 
 ## 1. Build and push container images
 
+**Build these images on a separate x86_64 Linux VM with sufficient memory and disk space. OCI Cloud Shell does not provide enough memory for the Mooncake source build (and its home filesystem may also be too small).** The `mooncake-store` image compiles Mooncake from source, so do not run `scripts/build-push.sh` in Cloud Shell.
+
 The images are:
 
 - `mooncake-store`: Mooncake master, owner client, Store Python binding, and benchmark sources, built CPU-only from the pinned Mooncake source.
@@ -103,29 +105,24 @@ kubectl get deviceclasses
 kubectl get resourceslices -o wide
 ```
 
-Run a two-pod RDMA smoke test; the pods request `ens800f0np0` from DRANET and anti-affinity places them on different workers:
+Run the pairwise RDMA test. It creates one temporary DRA pod per Ready DRANET worker, discovers each pod's RoCE v2 GID for `ens800f0np0`, and runs `ib_write_bw` in both directions for every node pair. It uses 64 KiB writes and 1,000 iterations, so `N` eligible nodes result in `N × (N − 1)` directed tests. Results and per-direction logs are saved under `rdma-pair-results-*`.
+
+```bash
+RDMA_TOOLS_IMAGE="$RDMA_TOOLS_IMAGE" bash scripts/test-rdma-pairs.sh
+```
+
+The pairwise script requires the `dra.net` DeviceClass, the `ocir-pull` secret in `rdma-workloads`, and one allocatable RDMA device on each participating node. Run one copy at a time. It returns non-zero if a node preflight or directed pair test fails. For troubleshooting, keep its temporary pods and claims with `KEEP_PODS=1`; remove them using the run ID printed in the results:
+
+```bash
+kubectl -n rdma-workloads delete pods,resourceclaims -l rdma-pair-run=<RUN_ID>
+```
+
+Set `RDMA_DEVICE` or `RDMA_NETDEV` to test a different NIC or interface. The script checks that the selected GID is typed `RoCE v2` and bound to that interface rather than assuming a fixed index. A passing result proves the tested directed pair transferred RDMA writes; it does not establish application-level performance or validate pairs that were skipped.
+
+The two-pod allocation-only smoke test remains available when diagnosing DRA placement. If you run it, delete its pods and claims before the pairwise test because the allocated RDMA devices are already in use:
 
 ```bash
 RDMA_TOOLS_IMAGE="$RDMA_TOOLS_IMAGE" bash scripts/apply-rdma-smoke.sh
-```
-
-The script reports the two DRA interface addresses. In one terminal, start the server using RoCE v2 GID index 5. On the tested BM.Optimized3.36 setup, index 3 was an all-zero GID; index 5 maps to `ens800f0np0` and is RoCE v2:
-
-```bash
-kubectl -n rdma-workloads exec -it rdma-smoke-a -- ib_write_bw -d mlx5_2 -x 5
-```
-
-In another terminal, connect the other pod to the server address printed by the script:
-
-```bash
-kubectl -n rdma-workloads exec -it rdma-smoke-b -- ib_write_bw -d mlx5_2 -x 5 <RDMA_SMOKE_A_IP>
-```
-
-If using a different NIC or node shape, inspect `/sys/class/infiniband/mlx5_2/ports/1/gid_attrs/` in both pods and select the GID index whose type is `RoCE v2` and whose netdev is `ens800f0np0`. Use that index on both server and client (`-x`); `-F` only changes CPU-frequency warning behavior.
-
-A successful bandwidth summary proves the DRA-allocated pod path between those two nodes. `rdma link show` reporting ACTIVE by itself only proves local link state. Clean up the smoke claims/pods when done:
-
-```bash
 kubectl -n rdma-workloads delete -f k8s/dranet/rdma-smoke.yaml
 ```
 
@@ -235,9 +232,39 @@ OWNERS=4 CLIENTS_PER_OWNER=8 PROTOCOL=rdma DEVICE_NAME=mlx5_2 \
 IMAGE="$STORE_IMAGE" bash benchmarks/scale-store.sh
 ```
 
-For comparisons, rerun at `OWNERS=1`, `2`, and `4` only after resizing the worker pool to exactly that count, using the same client-per-owner ratio, object size/count, duration, transport, and fresh run. Repeat each point at least three times and report median plus range. To isolate client concurrency, keep the node pool and owner count fixed (for example four owners) while sweeping `CLIENTS_PER_OWNER=2,4,8`. Don’t change owner count and client concurrency together if the aim is to identify the bottleneck.
+#### Compare owner counts without resizing the node pool
 
-Every run leaves its benchmark pods and cache keys for inspection. Remove only the benchmark clients after copying results:
+To measure Mooncake owner-count scaling while holding the worker pool fixed, use `scale-store-same-pool.sh`. It selects a subset of Ready RDMA workers by temporarily adding a node label and restricting only the Mooncake storage DaemonSet to that subset. It does **not** call OCI or change the node-pool size. The script restores the DaemonSet's exact original `nodeSelector`, removes its temporary labels, deletes benchmark client pods, and waits for the original owner set to become Ready—even when a benchmark step fails or is interrupted.
+
+Before starting, make sure the cluster has at least as many Ready, labeled `BM.Optimized3.36` RDMA workers as the largest `OWNERS_SWEEP` value; the master is healthy; the Mooncake owners and clients use the same transport; no other benchmark client pods are running; and the OCIR image is pullable. A DaemonSet selector change deletes and recreates owner pods, so this interrupts Mooncake service, clears their RAM cache, and can take a few minutes because of pod termination grace periods. Run during a quiet window and do not resize the node pool during the sweep. A four-owner point requires four eligible Ready workers; the helper will stop if fewer are available.
+
+For the two-clients-per-owner RDMA sweep:
+
+```bash
+IMAGE="$STORE_IMAGE" \
+OWNERS_SWEEP="1 2 3 4" \
+CLIENTS_PER_OWNER=2 \
+PROTOCOL=rdma \
+DEVICE_NAME=mlx5_2 \
+bash benchmarks/scale-store-same-pool.sh
+```
+
+The helper picks workers in sorted Kubernetes node-name order. For each count it marks the selected workers, applies a temporary DaemonSet selector, waits until exactly that many owners are Ready, then runs `scale-store.sh` with a unique result directory. It deletes client pods between points so each run starts cleanly. The controlled owner-count curve uses two independent clients per owner, producing 2, 4, 6, or 8 clients for 1, 2, 3, or 4 owners; to vary concurrency separately, keep `OWNERS_SWEEP` fixed and change only `CLIENTS_PER_OWNER`.
+
+`scale-store.sh` runs the native `store_kv_bench.py` read workload: RDMA over `mlx5_2`, zero-copy I/O, one job, queue depth one, batch size 16, 4,096 1 MiB values per client (4 GiB/client), 30-second timed reads, 64-byte keys, one memory replica, and no DFS replica. It prepares the objects before timing the reads, uses a fresh key prefix per client/run, and sums per-client read throughput into aggregate MiB/s. With two clients per owner, each point presents 8, 16, 24, or 32 GiB of client working set across 1, 2, 3, or 4 owners. This is a RAM-backed Store throughput test, not an NVMe-offload or vLLM benchmark.
+
+The measured four-owner first test and later 1/2/3-owner sweep from 2026-11-10 are recorded in [the benchmark report](benchmarks/results/2026-11-10-owner-sweeps.md). All four points had zero failed objects, misses, and verification failures. Treat these as one observation per point; repeat each point at least three times and report median plus range before drawing firm scaling conclusions. Capture worker CPU, memory, and NIC counters alongside throughput where possible.
+
+For reproducibility, the matching low-level command for one point is:
+
+```bash
+OWNERS=2 CLIENTS_PER_OWNER=2 PROTOCOL=rdma DEVICE_NAME=mlx5_2 \
+IMAGE="$STORE_IMAGE" bash benchmarks/scale-store.sh
+```
+
+Run that command only when exactly two Mooncake owner pods are Ready. The same-pool helper safely arranges and restores those owner counts for you.
+
+The standalone `scale-store.sh` leaves its benchmark pods for inspection. The same-pool sweep helper removes its client pods after each point. For a standalone run, copy the results first, then remove only the benchmark clients:
 
 ```bash
 kubectl -n mooncake delete pods -l app=mooncake-benchmark-client
@@ -283,17 +310,9 @@ The benchmark script uses 32 deterministic 4,096-token inputs, an explicit model
 
 For RDMA, both owners and requester must use `PROTOCOL=rdma`; RDMA link initialization alone does not prove KV payload traffic. Compare `mlx5_2` port counters before/after a warm run and correlate the increase with successful external loads. Owner transport changes restart the owners and clear their RAM cache.
 
-## 7. Recorded scale results from the earlier lab
+## 7. Recorded scale results
 
-These summary figures were recorded in the task conversation; raw logs are not bundled. They are a reference for reruns, not a promise that a new cluster will match them.
-
-| Ready owners | Independent clients | Mean aggregate read throughput | Quality notes |
-|---:|---:|---:|---|
-| 1 | 8 | 8,993.5 MiB/s | 3/3 runs clean |
-| 2 | 16 | 14,398.6 MiB/s | 49 misses / 16 failed requests total; 2/3 runs clean |
-| 4 | 32 | 15,871.2 MiB/s | 154 misses / 26 failed requests total; no verification failures |
-
-The 2→4 owner step added about 10% aggregate throughput while errors increased. These results do not establish a Mooncake hard limit because owner count and client count changed together. Rerun clean controlled sweeps before scaling beyond four workers.
+See the [2026-11-10 owner-sweeps report](benchmarks/results/2026-11-10-owner-sweeps.md) for today's measured results and reproduction steps. The first test measured four owners; a later sweep measured 1, 2, and 3 owners after only three workers were Ready. To repeat the full curve under one session, run `OWNERS_SWEEP="1 2 3 4" CLIENTS_PER_OWNER=2` with `scale-store-same-pool.sh` when four eligible workers are available.
 
 ## Troubleshooting and cleanup
 
