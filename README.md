@@ -1,8 +1,18 @@
-# Mooncake Store on OKE BM.Optimized3.36
+# A scalable KV Cache infrastructure
 
-A reproducible lab kit for OKE workers with RoCE v2 RDMA, DRANET/DRA, node-local NVMe, Mooncake Store, its native store benchmark, and an optional CPU-only vLLM + Mooncake Store connector test.
+This repository demonstrates a distributed KV cache built with [Mooncake Store](https://github.com/kvcache-ai/Mooncake) on Oracle Kubernetes Engine (OKE), using OCI BM.Optimized3.36 workers and their RoCE v2 RDMA network. It includes reproducible setup for DRANET/DRA, node-local NVMe, Mooncake Store, pairwise RDMA validation, Mooncake's native store benchmark, and an optional CPU-only vLLM integration test.
 
-This repo automates Kubernetes-side setup and image build/push. It does **not** create, resize, or reconfigure an OCI node pool. It is a lab reference, not a highly available or durable cache service: the master has one replica, cached data can disappear when nodes scale in, and applications must tolerate misses.
+## What Mooncake is
+
+Mooncake is an open-source storage and data-transfer system designed for LLM inference workloads. Mooncake Store lets inference workers place and retrieve KV cache blocks through a shared, distributed store. This can let multiple inference instances reuse cached prompt state and access a larger cache pool than the RAM available on a single serving host. Mooncake can use host memory and, when configured, local SSD/NVMe for storage; its transfer engine supports TCP and RDMA transports.
+
+## How this uses OCI RDMA
+
+The lab runs Mooncake Store owners on OKE worker nodes backed by OCI RDMA-capable BM.Optimized3.36 shapes. Those shapes expose ConnectX RoCE v2 networking. DRANET and Kubernetes Dynamic Resource Allocation (DRA) make the RDMA interface available to diagnostic and workload pods, and the included pairwise test verifies actual transfers between nodes. Mooncake owners can then communicate over the worker fabric with the selected transport, using RDMA when enabled or TCP as a baseline. Adding eligible workers adds owner capacity and can grow the aggregate KV cache backed by their RAM and configured local NVMe.
+
+This is a scalable lab reference, not a production HA service: the included Mooncake master has one replica, cache contents are not durable across worker scale-in, and applications must handle cache misses. RDMA availability also depends on each worker's fabric and interface health, so validate nodes and pairs instead of assuming every Ready Kubernetes node has working RDMA.
+
+This repo automates Kubernetes-side setup and image build/push. It does **not** create, resize, or reconfigure an OCI node pool.
 
 ## What was exercised
 
